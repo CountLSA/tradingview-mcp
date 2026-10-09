@@ -11,10 +11,12 @@ register('ohlcv', {
   options: {
     count: { type: 'string', short: 'n', description: 'Number of bars (default 100, max 500)' },
     summary: { type: 'boolean', short: 's', description: 'Return summary stats instead of all bars' },
+    before: { type: 'string', short: 'b', description: 'Only bars older than this Unix time in seconds (pages older history)' },
   },
   handler: (opts) => core.getOhlcv({
     count: opts.count ? Number(opts.count) : undefined,
     summary: opts.summary,
+    before: opts.before !== undefined ? Number(opts.before) : undefined,
   }),
 });
 

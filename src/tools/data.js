@@ -3,11 +3,12 @@ import { jsonResult } from './_format.js';
 import * as core from '../core/data.js';
 
 export function registerDataTools(server) {
-  server.tool('data_get_ohlcv', 'Get OHLCV bar data from the chart. Use summary=true for compact stats instead of all bars (saves context).', {
+  server.tool('data_get_ohlcv', 'Get OHLCV bar data from the chart, oldest first. Without before: the newest count bars already loaded. With before: the newest count bars older than that time; page back by passing the returned bars[0].time as the next before (windows join without gaps or overlap). A before read may load older history into the chart (requestMoreData, at most 10 pages per call); oldest_reached=true means TradingView reports no older history. total_available is the number of bars currently loaded, not the history that exists. Use summary=true for compact stats instead of all bars (saves context).', {
     count: z.coerce.number().optional().describe('Number of bars to retrieve (max 500, default 100)'),
     summary: z.coerce.boolean().optional().describe('Return summary stats (high, low, open, close, avg volume, range) instead of all bars — much smaller output'),
-  }, async ({ count, summary }) => {
-    try { return jsonResult(await core.getOhlcv({ count, summary })); }
+    before: z.coerce.number().optional().describe('Exclusive bar-time cursor in Unix seconds: return bars with time < before. Omit for the newest bars'),
+  }, async ({ count, summary, before }) => {
+    try { return jsonResult(await core.getOhlcv({ count, summary, before })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 

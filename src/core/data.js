@@ -1,10 +1,15 @@
 /**
  * Core data access logic.
  */
-import { evaluate, evaluateAsync, KNOWN_PATHS, safeString } from '../connection.js';
+import { evaluate, evaluateAsync, KNOWN_PATHS, safeString, requireFinite } from '../connection.js';
 import { waitForChartReady } from '../wait.js';
 
 const MAX_OHLCV_BARS = 500;
+// History paging for `before` windows: same page size and settle wait as
+// chart.setVisibleRange, with a smaller per-call budget so one read stays bounded.
+const HISTORY_PAGE_BARS = 1000;
+const HISTORY_PAGE_WAIT_MS = 1800;
+const MAX_HISTORY_PAGES = 10;
 const MAX_TRADES = 20;
 
 // Round to 8 dp — enough to kill float noise (29899.999999997 → 29900) without
@@ -134,28 +139,87 @@ function buildGraphicsJS(collectionName, mapKey, filter) {
   `;
 }
 
-export async function getOhlcv({ count, summary } = {}) {
-  const limit = Math.min(count || 100, MAX_OHLCV_BARS);
-  let data;
-  try {
-    data = await evaluate(`
-      (function() {
-        var bars = ${BARS_PATH};
-        if (!bars || typeof bars.lastIndex !== 'function') return null;
-        var result = [];
-        var end = bars.lastIndex();
-        var start = Math.max(bars.firstIndex(), end - ${limit} + 1);
-        for (var i = start; i <= end; i++) {
-          var v = bars.valueAt(i);
-          if (v) result.push({time: v[0], open: v[1], high: v[2], low: v[3], close: v[4], volume: v[5] || 0});
-        }
-        return {bars: result, total_bars: bars.size(), source: 'direct_bars'};
-      })()
-    `);
-  } catch { data = null; }
+function _resolveOhlcvDeps(deps) {
+  return {
+    evaluate: deps?.evaluate || evaluate,
+    sleep: deps?.sleep || ((ms) => new Promise(r => setTimeout(r, ms))),
+  };
+}
 
-  if (!data || !data.bars || data.bars.length === 0) {
+// Reads up to `limit` loaded bars, oldest first. Without `before`: the newest
+// bars. With `before` (Unix seconds, exclusive): the newest bars whose time is
+// < before, plus what is needed to decide whether older history must be loaded.
+function ohlcvWindowJS(limit, before) {
+  return `
+    (function() {
+      var ms = ${CHART_API}._chartWidget.model().mainSeries();
+      var bars = ms.bars();
+      if (!bars || typeof bars.lastIndex !== 'function') return null;
+      var first = bars.firstIndex();
+      var end = bars.lastIndex();
+      var before = ${before == null ? 'null' : before};
+      if (before !== null) {
+        for (; end >= first; end--) { var e = bars.valueAt(end); if (e && e[0] < before) break; }
+      }
+      var result = [];
+      var start = Math.max(first, end - ${limit} + 1);
+      for (var i = start; i <= end; i++) {
+        var v = bars.valueAt(i);
+        if (v) result.push({time: v[0], open: v[1], high: v[2], low: v[3], close: v[4], volume: v[5] || 0});
+      }
+      var out = {bars: result, total_bars: bars.size(), source: 'direct_bars'};
+      if (before !== null) {
+        var fv = bars.valueAt(first);
+        var more = null;
+        try { var m = ms.requestMoreDataAvailable(); if (typeof m === 'boolean') more = m; } catch (e) {}
+        out.first_loaded_time = fv ? fv[0] : null;
+        out.at_first_loaded = start <= first;
+        out.more = more;
+      }
+      return out;
+    })()
+  `;
+}
+
+export async function getOhlcv({ count, summary, before, _deps } = {}) {
+  const { evaluate, sleep } = _resolveOhlcvDeps(_deps);
+  const limit = Math.min(count || 100, MAX_OHLCV_BARS);
+  if (!Number.isInteger(limit) || limit < 1) throw new Error(`count must be a positive integer, got: ${count}`);
+  const windowed = before != null;
+  const cursor = windowed ? requireFinite(before, 'before') : null;
+  if (windowed && (cursor <= 0 || cursor > 1e11)) throw new Error(`before must be a bar time in Unix seconds, got: ${before}`);
+
+  const read = async () => { try { return await evaluate(ohlcvWindowJS(limit, cursor)); } catch { return null; } };
+  let data = await read();
+
+  // A `before` window that runs into the first loaded bar pages older history
+  // into the main series, until the window is full, TradingView reports no
+  // more data, a page brings nothing older, or the page budget is spent.
+  let pages = 0;
+  while (windowed && data && data.bars && data.bars.length < limit && data.at_first_loaded
+         && data.more !== false && pages < MAX_HISTORY_PAGES) {
+    const prevFirst = data.first_loaded_time;
+    await evaluate(`(function() { try { ${CHART_API}._chartWidget.model().mainSeries().requestMoreData(${HISTORY_PAGE_BARS}); } catch (e) {} })()`);
+    pages++;
+    await sleep(HISTORY_PAGE_WAIT_MS);
+    data = await read();
+    if (!data || data.first_loaded_time == null || prevFirst == null || !(data.first_loaded_time < prevFirst)) break;
+  }
+
+  if (!data || !data.bars || (data.bars.length === 0 && !windowed)) {
     throw new Error('Could not extract OHLCV data. The chart may still be loading.');
+  }
+
+  let windowInfo = {};
+  if (windowed) {
+    windowInfo = { before: cursor, oldest_reached: data.at_first_loaded && data.more === false, pages_requested: pages };
+    if (data.bars.length === 0) {
+      if (!windowInfo.oldest_reached) {
+        throw new Error(`No loaded bars older than before=${cursor} after ${pages} history page request(s); the loaded series `
+          + `starts at ${data.first_loaded_time}. Older history may still be loading: retry the same request.`);
+      }
+      return { success: true, bar_count: 0, total_available: data.total_bars, source: data.source, ...windowInfo, bars: [] };
+    }
   }
 
   if (summary) {
@@ -175,10 +239,11 @@ export async function getOhlcv({ count, summary } = {}) {
       change_pct: Math.round(((last.close - first.open) / first.open) * 10000) / 100 + '%',
       avg_volume: Math.round(volumes.reduce((a, b) => a + b, 0) / volumes.length),
       last_5_bars: bars.slice(-5),
+      ...windowInfo,
     };
   }
 
-  return { success: true, bar_count: data.bars.length, total_available: data.total_bars, source: data.source, bars: data.bars };
+  return { success: true, bar_count: data.bars.length, total_available: data.total_bars, source: data.source, ...windowInfo, bars: data.bars };
 }
 
 export async function getIndicator({ entity_id }) {
